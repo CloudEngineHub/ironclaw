@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0](https://github.com/nearai/ironclaw/compare/v0.12.0...v0.13.0) - 2026-02-27
+
+### Added
+
+- feat(signal) attachment upload  + message tool ([#375](https://github.com/nearai/ironclaw/pull/375))
+
+### Fixed
+
+- prevent duplicate WASM channel activation on startup ([#390](https://github.com/nearai/ironclaw/pull/390))
+
+### Other
+
+- Add automated QA: schema validator, CI matrix, Docker build, and P1 test coverage ([#353](https://github.com/nearai/ironclaw/pull/353))
+
 ## [0.12.0](https://github.com/nearai/ironclaw/compare/v0.11.1...v0.12.0) - 2026-02-26
 
 ### Added
