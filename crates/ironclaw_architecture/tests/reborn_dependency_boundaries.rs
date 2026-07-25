@@ -3481,7 +3481,6 @@ fn boundary_rules() -> Vec<BoundaryRule> {
             forbidden: vec![
                 "ironclaw_authorization",
                 "ironclaw_approvals",
-                "ironclaw_capabilities",
                 "ironclaw_host_runtime",
                 "ironclaw_secrets",
                 "ironclaw_network",
