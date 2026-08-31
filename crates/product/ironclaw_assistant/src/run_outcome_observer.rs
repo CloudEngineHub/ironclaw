@@ -269,16 +269,15 @@ impl RunOutcomeProcessCommitObserver {
         }
     }
 
-    async fn resolve_run_authentication_required(
+    async fn resolve_open_run_notifications(
         &self,
         snapshot: &JournaledProcessSnapshot,
         run_id: TurnRunId,
+        kind: NotificationKind,
         occurred_at: Timestamp,
     ) -> Result<(), String> {
-        // A Resumed process snapshot no longer carries the suspension's gate
-        // reference. Reconcile by the notification's stable run identity;
-        // the recipient Inbox is bounded, and paging preserves older or
-        // archived records that may have survived a transient write outage.
+        // Reconcile by the notification's stable run identity; paging preserves
+        // older or archived records that may have survived a transient outage.
         let Some(owner_user_id) = snapshot.owner_user_id.clone() else {
             return Ok(());
         };
@@ -286,13 +285,14 @@ impl RunOutcomeProcessCommitObserver {
             tenant_id: snapshot.scope.tenant_id.clone(),
             user_id: owner_user_id,
         };
-        // A later auth gate can already be current by the time this older
-        // Resumed commit reaches the observer. Preserve that gate's stable
-        // record: actionable retries intentionally do not reopen records that
-        // were resolved by an earlier lifecycle transition.
-        let current_auth_gate_ref = match self.process_journal_source.as_deref() {
-            Some(source) => Self::current_auth_gate_ref(source, snapshot).await?,
-            None => None,
+        // A later auth gate can already be current by the time an older
+        // Resumed commit arrives. Only auth reconciliation preserves it;
+        // terminal approval reconciliation closes every open gate for the run.
+        let current_auth_gate_ref = match (kind, self.process_journal_source.as_deref()) {
+            (NotificationKind::AuthenticationRequired, Some(source)) => {
+                Self::current_auth_gate_ref(source, snapshot).await?
+            }
+            _ => None,
         };
         let mut cursor = None;
         loop {
@@ -305,9 +305,7 @@ impl RunOutcomeProcessCommitObserver {
                     include_archived: true,
                 })
                 .await
-                .map_err(|error| {
-                    format!("list auth notifications for resumed run failed: {error}")
-                })?;
+                .map_err(|error| format!("list {kind:?} notifications for run failed: {error}"))?;
             for notification in page.notifications {
                 let is_current_auth_gate = current_auth_gate_ref.as_ref().is_some_and(|gate_ref| {
                     notification
@@ -316,28 +314,36 @@ impl RunOutcomeProcessCommitObserver {
                         .as_ref()
                         .is_some_and(|lifecycle_ref| lifecycle_ref.as_str() == gate_ref.as_str())
                 });
-                if notification.kind == NotificationKind::AuthenticationRequired
+                if notification.kind == kind
                     && notification.source.turn_run_id == Some(run_id)
                     && notification.resolved_at.is_none()
                     && !is_current_auth_gate
                 {
-                    self.inbox
+                    match self
+                        .inbox
                         .resolve(NotificationMutationRequest {
                             recipient: recipient.clone(),
                             notification_id: notification.id,
                             occurred_at,
                         })
                         .await
-                        .map_err(|error| {
-                            format!("resolve auth notification for resumed run failed: {error}")
-                        })?;
+                    {
+                        Ok(_) | Err(NotificationInboxError::NotificationNotFound) => {}
+                        Err(error) => {
+                            return Err(format!(
+                                "resolve {kind:?} notification for run failed: {error}"
+                            ));
+                        }
+                    }
                 }
             }
             let Some(next_cursor) = page.next_cursor else {
                 return Ok(());
             };
             if cursor.as_ref() == Some(&next_cursor) {
-                return Err("auth notification pagination cursor did not advance".to_string());
+                return Err(format!(
+                    "{kind:?} notification pagination cursor did not advance"
+                ));
             }
             cursor = Some(next_cursor);
         }
@@ -530,8 +536,13 @@ impl ProcessJournalCommitObserver for RunOutcomeProcessCommitObserver {
         if commit.kind == ProcessJournalKind::Resumed
             && metadata.resume_disposition != Some(GateResumeDisposition::Denied)
         {
-            self.resolve_run_authentication_required(&commit.state, run_id, occurred_at)
-                .await?;
+            self.resolve_open_run_notifications(
+                &commit.state,
+                run_id,
+                NotificationKind::AuthenticationRequired,
+                occurred_at,
+            )
+            .await?;
         }
         if commit.kind == ProcessJournalKind::Suspended
             && commit.state.status == ProcessLifecycleStatus::Suspended
@@ -622,6 +633,51 @@ impl ProcessJournalCommitObserver for RunOutcomeProcessCommitObserver {
             _ => {}
         }
         Ok(())
+    }
+}
+
+/// Durable replay for approval notifications introduced after the primary
+/// outcome observer had already advanced past terminal run commits. This owns
+/// approval cleanup for both replayed and future terminal background runs so
+/// the primary v1 observer keeps its cursor without duplicating Inbox scans.
+pub struct ApprovalNotificationBackfillProcessCommitObserver {
+    outcome_observer: RunOutcomeProcessCommitObserver,
+}
+
+impl ApprovalNotificationBackfillProcessCommitObserver {
+    pub fn new(
+        inbox: Arc<dyn NotificationInboxStorePort>,
+        thread_service: Arc<dyn SessionThreadService>,
+    ) -> Self {
+        Self {
+            outcome_observer: RunOutcomeProcessCommitObserver::new(inbox, thread_service),
+        }
+    }
+}
+
+#[async_trait]
+impl ProcessJournalCommitObserver for ApprovalNotificationBackfillProcessCommitObserver {
+    fn process_observer_id(&self) -> &'static str {
+        "run-approval-inbox-backfill-observer-v1"
+    }
+
+    async fn observe_process_commit(&self, commit: ProcessJournalCommit) -> Result<(), String> {
+        let Some(metadata) = eligible_user_run(&commit.state) else {
+            return Ok(());
+        };
+        if !is_background_run(&metadata) || !commit.state.status.is_terminal() {
+            return Ok(());
+        }
+        let run_id = TurnRunId::from_uuid(commit.state.process_id.as_uuid());
+        let occurred_at = commit.occurred_at.unwrap_or(commit.state.created_at);
+        self.outcome_observer
+            .resolve_open_run_notifications(
+                &commit.state,
+                run_id,
+                NotificationKind::ApprovalRequired,
+                occurred_at,
+            )
+            .await
     }
 }
 
@@ -930,6 +986,7 @@ mod tests {
     use serde_json::json;
 
     use super::{
+        ApprovalNotificationBackfillProcessCommitObserver,
         AuthNotificationBackfillProcessCommitObserver, ResourceBlockBackfillProcessCommitObserver,
         RunOutcomeProcessCommitObserver,
     };
@@ -1050,6 +1107,13 @@ mod tests {
     struct FailFirstResolveInbox {
         inner: Arc<dyn NotificationInboxStorePort>,
         fail_next_resolve: AtomicBool,
+        failure: FirstResolveFailure,
+    }
+
+    #[derive(Clone, Copy)]
+    enum FirstResolveFailure {
+        Backend,
+        NotFoundAfterResolve,
     }
 
     impl FailFirstResolveInbox {
@@ -1057,6 +1121,15 @@ mod tests {
             Self {
                 inner,
                 fail_next_resolve: AtomicBool::new(true),
+                failure: FirstResolveFailure::Backend,
+            }
+        }
+
+        fn not_found_after_resolve(inner: Arc<dyn NotificationInboxStorePort>) -> Self {
+            Self {
+                inner,
+                fail_next_resolve: AtomicBool::new(true),
+                failure: FirstResolveFailure::NotFoundAfterResolve,
             }
         }
     }
@@ -1096,9 +1169,15 @@ mod tests {
             request: NotificationMutationRequest,
         ) -> Result<NotificationMutationOutcome, NotificationInboxError> {
             if self.fail_next_resolve.swap(false, Ordering::SeqCst) {
-                return Err(NotificationInboxError::Backend {
-                    reason: "injected post-publish compensation failure".to_string(),
-                });
+                return match self.failure {
+                    FirstResolveFailure::Backend => Err(NotificationInboxError::Backend {
+                        reason: "injected post-publish compensation failure".to_string(),
+                    }),
+                    FirstResolveFailure::NotFoundAfterResolve => {
+                        self.inner.resolve(request).await?;
+                        Err(NotificationInboxError::NotificationNotFound)
+                    }
+                };
             }
             self.inner.resolve(request).await
         }
@@ -1895,11 +1974,10 @@ mod tests {
         );
     }
 
-    /// A timed-out fire publishes an actionable block and the delivery watcher
-    /// then returns, so nothing else ever observes that run again. Only a
-    /// terminal fact can retire the record.
+    /// The primary observer retains its cursor while the approval backfill
+    /// replays terminal facts that older deployments already acknowledged.
     #[tokio::test]
-    async fn a_terminal_run_resolves_the_block_left_behind_by_a_delivery_timeout() {
+    async fn terminal_observers_resolve_stale_actionable_notifications() {
         for status in [
             ProcessLifecycleStatus::Completed,
             ProcessLifecycleStatus::Failed,
@@ -1951,6 +2029,34 @@ mod tests {
                 })
                 .await
                 .expect("seed the timed-out block");
+            inbox
+                .publish(PublishNotificationRequest {
+                    id: crate::run_delivery::run_notification_inbox_id(
+                        run_id,
+                        NotificationKind::ApprovalRequired,
+                        Some("gate:terminal-reconciliation"),
+                    )
+                    .expect("approval notification id"),
+                    recipient: recipient.clone(),
+                    kind: NotificationKind::ApprovalRequired,
+                    severity: NotificationSeverity::Warning,
+                    source: NotificationSource {
+                        thread_id: Some(thread()),
+                        turn_run_id: Some(run_id),
+                        lifecycle_ref: Some(
+                            LifecycleRef::new("gate:terminal-reconciliation")
+                                .expect("approval lifecycle ref"),
+                        ),
+                        credential_providers: Vec::new(),
+                    },
+                    action: NotificationAction::OpenThread {
+                        thread_id: thread(),
+                    },
+                    initial_state: NotificationInitialState::Open,
+                    occurred_at: Utc::now(),
+                })
+                .await
+                .expect("seed the stale approval notification");
 
             if status == ProcessLifecycleStatus::Completed {
                 threads
@@ -1964,19 +2070,54 @@ mod tests {
                     .expect("completed run final reply");
             }
 
-            let observer = RunOutcomeProcessCommitObserver::new(
+            let terminal_commit = commit(
+                run_id,
+                status,
+                ProcessJournalKind::Completed,
+                "scheduled_trigger",
+            );
+            let primary = RunOutcomeProcessCommitObserver::new(
                 Arc::clone(&inbox) as Arc<dyn NotificationInboxStorePort>,
                 Arc::clone(&threads) as Arc<dyn SessionThreadService>,
             );
-            observer
-                .observe_process_commit(commit(
-                    run_id,
-                    status,
-                    ProcessJournalKind::Completed,
-                    "scheduled_trigger",
-                ))
+            primary
+                .observe_process_commit(terminal_commit.clone())
                 .await
-                .expect("terminal commit");
+                .expect("primary terminal commit");
+            let before_backfill = inbox
+                .list(ListNotificationsRequest {
+                    recipient: recipient.clone(),
+                    limit: 10,
+                    cursor: None,
+                    include_archived: true,
+                })
+                .await
+                .expect("list before approval backfill");
+            assert!(
+                before_backfill
+                    .notifications
+                    .iter()
+                    .find(|record| record.kind == NotificationKind::ApprovalRequired)
+                    .is_some_and(|record| record.resolved_at.is_none()),
+                "the stable primary cursor must leave historical approval cleanup to the backfill"
+            );
+
+            let backfill_inbox: Arc<dyn NotificationInboxStorePort> =
+                if status == ProcessLifecycleStatus::Completed {
+                    Arc::new(FailFirstResolveInbox::not_found_after_resolve(
+                        Arc::clone(&inbox) as Arc<dyn NotificationInboxStorePort>,
+                    ))
+                } else {
+                    Arc::clone(&inbox) as Arc<dyn NotificationInboxStorePort>
+                };
+            let backfill = ApprovalNotificationBackfillProcessCommitObserver::new(
+                backfill_inbox,
+                Arc::clone(&threads) as Arc<dyn SessionThreadService>,
+            );
+            backfill
+                .observe_process_commit(terminal_commit)
+                .await
+                .expect("historical terminal approval reconciliation");
 
             let page = inbox
                 .list(ListNotificationsRequest {
@@ -1995,6 +2136,15 @@ mod tests {
             assert!(
                 block.resolved_at.is_some(),
                 "{status:?} must retire the block a delivery timeout left open",
+            );
+            let approval = page
+                .notifications
+                .iter()
+                .find(|record| record.kind == NotificationKind::ApprovalRequired)
+                .expect("the approval record survives");
+            assert!(
+                approval.resolved_at.is_some(),
+                "{status:?} must retire an approval left open by a delivery watcher",
             );
         }
     }
@@ -2079,16 +2229,27 @@ mod tests {
     }
 
     #[test]
-    fn primary_outcome_observer_preserves_its_v1_cursor_identity() {
-        let observer = RunOutcomeProcessCommitObserver::new(
-            inbox() as Arc<dyn NotificationInboxStorePort>,
-            Arc::new(InMemorySessionThreadService::default()) as Arc<dyn SessionThreadService>,
+    fn approval_backfill_uses_a_new_cursor_without_changing_the_primary_identity() {
+        let inbox = inbox();
+        let threads = Arc::new(InMemorySessionThreadService::default());
+        let primary = RunOutcomeProcessCommitObserver::new(
+            Arc::clone(&inbox) as Arc<dyn NotificationInboxStorePort>,
+            Arc::clone(&threads) as Arc<dyn SessionThreadService>,
+        );
+        let approval_backfill = ApprovalNotificationBackfillProcessCommitObserver::new(
+            inbox as Arc<dyn NotificationInboxStorePort>,
+            threads as Arc<dyn SessionThreadService>,
         );
 
         assert_eq!(
-            observer.process_observer_id(),
+            primary.process_observer_id(),
             "run-outcome-inbox-commit-observer-v1",
-            "resource-block rollout must not replay every historical terminal outcome"
+            "the existing outcome cursor remains stable across the upgrade"
+        );
+        assert_eq!(
+            approval_backfill.process_observer_id(),
+            "run-approval-inbox-backfill-observer-v1",
+            "approval cleanup needs a fresh cursor to replay historical terminals"
         );
     }
 
