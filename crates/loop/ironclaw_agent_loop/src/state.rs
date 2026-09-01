@@ -66,9 +66,14 @@ pub struct LoopExecutionState {
 
     // executor-observed (populated by executor; read-only to strategies)
     pub recent_call_signatures: BoundedRing<CapabilityCallSignature, 8>,
-    /// Deprecated checkpoint field retained for rolling-upgrade and rollback
-    /// compatibility. The default loop policy no longer records or reads
-    /// output digests when deciding whether to continue.
+    /// (signature, output_digest) trail for completed calls whose result
+    /// carried a digest. Populated by `append_completed_capability_result`
+    /// (executor/capabilities.rs); read by
+    /// `DefaultStopConditionStrategy::should_stop_after_observed_turn`
+    /// (strategies/stop.rs) to detect a call whose OUTPUT repeats, not just
+    /// its signature. `#[serde(default)]` for rolling-upgrade/rollback: a
+    /// legacy checkpoint with no ring decodes to empty; the guard is inert
+    /// until repopulated by fresh calls.
     #[serde(default)]
     pub seen_capability_output_digests: BoundedRing<CapabilityOutputObservation, 64>,
     pub recent_failure_kinds: BoundedRing<LoopFailureKind, 8>,
@@ -414,7 +419,9 @@ impl LoopExecutionState {
     /// transcript/result refs in the payload are also owned by the source run;
     /// carrying them into the retry would make the retry's terminal exit claim
     /// foreign-run evidence. Reset these run-owned fields and let the retry host
-    /// produce its own refs.
+    /// produce its own refs. The repeat-call and output-digest observations
+    /// plus terminal warning/control state are likewise run-owned and are
+    /// reset below so the retry cannot inherit a no-progress strike.
     ///
     /// Gate-bound resume state (`last_gate`, `pending_approval_resume`,
     /// `pending_auth_resume`) is deliberately NOT cleared here: this same path
@@ -444,6 +451,15 @@ impl LoopExecutionState {
         // does any work. Reset it here so the retry starts its own budget
         // window. (Same-run gate resumes return early above, preserving it.)
         self.budget_ledger = BudgetLedger::fresh_for_run();
+        // Repeat-call and no-progress observations plus terminal warnings are
+        // also scoped to the source run. Carrying any of them across a retry
+        // would let the new run inherit a prior strike and terminate without
+        // earning it.
+        self.recent_call_signatures = BoundedRing::new();
+        self.seen_capability_output_digests = BoundedRing::new();
+        self.terminal_warning_state = TerminalWarningState::default();
+        self.stop_state.repeated_call_warning = None;
+        self.stop_state.trailing_no_progress_results = 0;
         self
     }
 }
@@ -1087,6 +1103,63 @@ mod tests {
     }
 
     #[test]
+    fn rebase_for_run_drops_no_progress_observations_and_warning_for_a_new_run() {
+        let source_context = test_run_context();
+        let target_context = test_run_context();
+        let mut state = LoopExecutionState::initial_for_run(&source_context);
+        let repeated_call_signature = CapabilityCallSignature::from_call(
+            CapabilityId::new("demo.echo").expect("valid capability id"),
+            &json!({"value": 1}),
+        )
+        .expect("valid call signature");
+        state
+            .recent_call_signatures
+            .push(repeated_call_signature.clone());
+        state.stop_state.repeated_call_warning =
+            Some(RepeatedCallWarningState::rendered(repeated_call_signature));
+        state
+            .seen_capability_output_digests
+            .push(CapabilityOutputObservation {
+                signature: CapabilityCallSignature::from_call(
+                    CapabilityId::new("demo.echo").expect("valid capability id"),
+                    &json!({"value": 1}),
+                )
+                .expect("valid call signature"),
+                output_digest: ironclaw_loop_contracts::ContentDigest(42),
+            });
+        assert!(
+            state
+                .terminal_warning_state
+                .schedule(TerminalWarningObservation::no_progress(Some(8), None))
+        );
+        state.stop_state.trailing_no_progress_results = 1;
+        state.pending_model_error_observation = Some(ModelErrorRecoveryObservation::transient());
+        state.pending_model_retry_directive = Some(PendingModelRetryDirective::RepairInvalidOutput);
+        state.recovery_state =
+            RecoveryStrategyState::with_attempts_for(RecoveryAttemptClass::ModelTransient, 2);
+
+        let rebased = state.clone().rebase_for_run(&target_context);
+
+        assert!(rebased.recent_call_signatures.is_empty());
+        assert!(rebased.stop_state.repeated_call_warning.is_none());
+        assert!(rebased.seen_capability_output_digests.is_empty());
+        assert_eq!(
+            rebased.terminal_warning_state,
+            TerminalWarningState::default()
+        );
+        assert_eq!(rebased.stop_state.trailing_no_progress_results, 0);
+        assert_eq!(
+            rebased.pending_model_error_observation,
+            state.pending_model_error_observation
+        );
+        assert_eq!(
+            rebased.pending_model_retry_directive,
+            state.pending_model_retry_directive
+        );
+        assert_eq!(rebased.recovery_state, state.recovery_state);
+    }
+
+    #[test]
     fn rebase_for_run_resets_per_run_budget_counters_for_a_different_run() {
         // A retry rebases the failed run's checkpoint onto a fresh TurnRunId.
         // run_started_at/model_calls_made/capability_invocations_made are
@@ -1145,9 +1218,40 @@ mod tests {
         state
             .budget_ledger
             .set_capability_invocations_made_for_test(7);
+        state
+            .seen_capability_output_digests
+            .push(CapabilityOutputObservation {
+                signature: CapabilityCallSignature::from_call(
+                    CapabilityId::new("demo.echo").expect("valid capability id"),
+                    &json!({"value": 1}),
+                )
+                .expect("valid call signature"),
+                output_digest: ironclaw_loop_contracts::ContentDigest(42),
+            });
+        let repeated_call_signature = CapabilityCallSignature::from_call(
+            CapabilityId::new("demo.echo").expect("valid capability id"),
+            &json!({"value": 1}),
+        )
+        .expect("valid call signature");
+        state
+            .recent_call_signatures
+            .push(repeated_call_signature.clone());
+        state.stop_state.repeated_call_warning =
+            Some(RepeatedCallWarningState::rendered(repeated_call_signature));
+        assert!(
+            state
+                .terminal_warning_state
+                .schedule(TerminalWarningObservation::no_progress(Some(8), None))
+        );
+        state.stop_state.trailing_no_progress_results = 1;
 
         let rebased = state.clone().rebase_for_run(&context);
 
+        assert_eq!(rebased.recent_call_signatures, state.recent_call_signatures);
+        assert_eq!(
+            rebased.stop_state.repeated_call_warning,
+            state.stop_state.repeated_call_warning
+        );
         assert_eq!(rebased, state);
     }
 

@@ -4,7 +4,7 @@ use tracing::debug;
 
 use crate::{
     state::{BoundedRing, LoopExecutionState, TerminalWarningObservation},
-    strategies::{StopKind, StopOutcome, TurnSummary},
+    strategies::{RepeatedOutputProgressStrategy, StopKind, StopOutcome, TurnSummary},
 };
 
 use super::{AgentLoopExecutorError, CancelCheck, CheckpointStage, ExecutorStage, StageContext};
@@ -143,16 +143,24 @@ impl StopStage {
     }
 }
 
-/// Convert an explicit strategy's first no-progress terminal into one normal
-/// loop iteration with typed model-visible recovery context. The default stop
-/// strategy does not emit this terminal; its repeated-call signal is advisory.
+/// Convert a strategy's first no-progress terminal into one normal loop
+/// iteration with typed model-visible recovery context — for an explicit
+/// non-default strategy AND for the default strategy's own windowed
+/// output-repetition check (strategies/stop.rs's
+/// `DefaultStopConditionStrategy::should_stop_after_observed_turn`). The
+/// default strategy's separate CONSECUTIVE-call advisory renders through a
+/// different path and never emits this `StopKind` on its own.
 fn schedule_no_progress_warning(state: &mut LoopExecutionState, kind: &StopKind) -> bool {
     if !matches!(kind, StopKind::NoProgressDetected) {
         return false;
     }
-    let repeated_call_count = state
-        .recent_call_signatures
-        .most_common_count_in(8)
+    // Same window the stop strategy used to trigger this path
+    // (`RepeatedOutputProgressStrategy`, strategies/progress.rs) — the digest
+    // ring, not the bare call-signature ring, since the terminating check
+    // dominates on (signature, output_digest) pairs and can trip on an
+    // alternating call-signature sequence.
+    let repeated_call_count = RepeatedOutputProgressStrategy::default()
+        .dominant_repeated_output_count(&state.seen_capability_output_digests)
         .min(u32::MAX as usize) as u32;
     let repeated_call_count = (repeated_call_count > 1).then_some(repeated_call_count);
     let last_failure = state.recent_failure_kinds.iter().next_back().copied();
@@ -167,6 +175,7 @@ fn schedule_no_progress_warning(state: &mut LoopExecutionState, kind: &StopKind)
     }
 
     state.recent_call_signatures = BoundedRing::new();
+    state.seen_capability_output_digests = BoundedRing::new();
     state.recent_output_token_counts = BoundedRing::new();
     state.stop_state.trailing_no_progress_results = 0;
     state.stop_state.repeated_call_warning = None;
