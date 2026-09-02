@@ -474,6 +474,7 @@ entries.
 | The user can… | Evidence |
 |---|---|
 | Browse the registry, search, install, configure, remove and reinstall an extension | `test_reborn_webui_v2_legacy_extensions.py` (36), `test_extensions.py` (59), `test_wasm_lifecycle.py` (35) |
+| Configure a credential-backed extension and read setup and configured feedback in the light theme | `test_reborn_webui_v2_smoke.py::test_reborn_v2_extension_configure_uses_shared_form_and_feedback` |
 | Recover when the catalog fails, enrichment fails, install fails, or they're offline | `test_reborn_webui_v2_legacy_extensions.py` |
 | Fill in a configure modal (all field variants, https-only setup URLs, focus trapping, enter-to-submit) | `test_reborn_webui_v2_legacy_extensions.py`, `test_extensions.py` |
 | See the right button label for authed vs unauthed extensions (#2235) | `test_settings_extensions_labels.py` (5) |
