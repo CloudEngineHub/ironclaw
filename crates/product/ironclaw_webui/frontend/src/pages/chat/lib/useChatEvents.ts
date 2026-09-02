@@ -23,6 +23,7 @@ import {
   isErrorChatMessage,
   isRunFailureMessageId,
   RUN_FAILURE_ID_PREFIX,
+  RUN_STOPPED_ID_PREFIX,
   STREAM_FAILURE_ID_PREFIX,
   UNKNOWN_RUN_FAILURE_ID,
 } from "./message-types";
@@ -104,6 +105,7 @@ export function useChatEvents({
       //   promptRunId — run id whose gate prompt is on screen.
       const {
         settledRuns: settledRunsRef,
+        locallyStoppedRuns: locallyStoppedRunsRef,
         latestRunId: latestRunIdRef,
         promptRunId: promptRunIdRef,
       } = runTrackingRef.current;
@@ -112,6 +114,16 @@ export function useChatEvents({
         threadId,
         activeRunRef?.current?.runId || latestRunIdRef.current,
       );
+      // A run the user stopped locally is fenced until its terminal
+      // projection settles it: every live frame scoped to it is dropped here,
+      // once, instead of per handler. The one exception is its final reply:
+      // that frame is the backend's own evidence that the cancel lost the
+      // race, so it lifts the stop (retracting the notice) and renders.
+      const frameRunId = runIdOfFrame(type, frame, activeRunRef, latestRunIdRef);
+      if (isLocallyStoppedRun(locallyStoppedRunsRef, frameRunId)) {
+        if (type !== "final_reply") return;
+        liftLocalStop(locallyStoppedRunsRef, setMessages, frameRunId);
+      }
 
       switch (type) {
         case "accepted": {
@@ -241,6 +253,7 @@ export function useChatEvents({
           setPendingGate(null);
           setIsProcessing(false);
           setActiveRun?.(null);
+          appendRunStoppedMessage(setMessages, { runId, t });
           settleRun(settledRunsRef, onRunSettled, runId, false);
           return;
         }
@@ -301,6 +314,7 @@ export function useChatEvents({
             setActiveRun,
             onRunSettled,
             settledRunsRef,
+            locallyStoppedRunsRef,
             latestRunIdRef,
             promptRunIdRef,
             activeRunRef,
@@ -345,6 +359,87 @@ function settleRun(settledRunsRef, onRunSettled, runId, success) {
   if (settledRunsRef.current.has(runId)) return;
   settledRunsRef.current.add(runId);
   onRunSettled(runId, { success });
+}
+
+function isLocallyStoppedRun(locallyStoppedRunsRef, runId) {
+  return Boolean(runId && locallyStoppedRunsRef?.current?.has(runId));
+}
+
+// The run a live frame is scoped to, derived the way its handler scopes it
+// (explicit id first, then the handler's own fallbacks). Terminal frames and
+// projection batches return null: terminal frames always settle, and the
+// projection loop fences per item.
+function runIdOfFrame(type, frame, activeRunRef, latestRunIdRef) {
+  switch (type) {
+    case "accepted":
+      return frame.ack?.run_id || null;
+    case "running":
+    case "capability_progress":
+      return (
+        frame.progress?.turn_run_id || activeRunRef?.current?.runId || null
+      );
+    case "capability_activity":
+      return fallbackTurnRunIdForActivity({
+        explicitRunId: frame.activity?.turn_run_id,
+        activeRunRef,
+        latestRunIdRef,
+      });
+    case "capability_display_preview":
+      return fallbackTurnRunIdForActivity({
+        explicitRunId: frame.preview?.turn_run_id,
+        activeRunRef,
+        latestRunIdRef,
+      });
+    case "gate":
+    case "auth_required":
+      return gateFromEvent(type, frame.prompt)?.runId || null;
+    case "final_reply":
+      return frame.reply?.turn_run_id || null;
+    default:
+      return null;
+  }
+}
+
+function isTerminalRunStatusItem(item) {
+  return Boolean(
+    item.run_status && TERMINAL_RUN_STATUSES.has(item.run_status.status),
+  );
+}
+
+// The run a projection item belongs to. Capability activity may omit its run
+// id; resolve it with the same batch-scoped fallback the item handler uses so
+// the fence and the rendered card agree on ownership.
+function runIdOfItem(
+  item,
+  { activeRunId, activeRunRef, latestRunIdRef, batchRunId },
+) {
+  const direct = item.run_status ?? item.text ?? item.thinking;
+  if (direct) return direct.run_id || null;
+  if (item.capability_activity) {
+    return fallbackTurnRunIdForActivity({
+      explicitRunId: item.capability_activity.turn_run_id,
+      activeRunId,
+      activeRunRef,
+      latestRunIdRef,
+      batchRunId,
+    });
+  }
+  if (item.gate) return gateFromProjectionGate(item.gate)?.runId || null;
+  return null;
+}
+
+// The cancel lost the race: the backend reached a terminal state other than
+// `cancelled` before honouring the stop. The "Stopped" notice is now a false
+// claim and the fence would swallow the run's finalized answer, so retract
+// both and let the terminal status settle the run like any other.
+function liftLocalStop(locallyStoppedRunsRef, setMessages, runId) {
+  if (!isLocallyStoppedRun(locallyStoppedRunsRef, runId)) return;
+  locallyStoppedRunsRef.current.delete(runId);
+  const messageId = runStoppedMessageId(runId);
+  setMessages((prev) => {
+    const next = prev.filter((message) => message.id !== messageId);
+    return next.length === prev.length ? prev : next;
+  });
 }
 
 const TERMINAL_RUN_STATUSES = new Set([
@@ -434,6 +529,7 @@ function applyProjectionItems({
   setActiveRun,
   onRunSettled,
   settledRunsRef,
+  locallyStoppedRunsRef,
   latestRunIdRef,
   promptRunIdRef,
   activeRunRef,
@@ -456,6 +552,12 @@ function applyProjectionItems({
     const runStatus = item.run_status;
     if (runStatus?.run_id && runStatus.status) {
       batchRunStatusByRunId.set(runStatus.run_id, runStatus.status);
+      if (
+        TERMINAL_RUN_STATUSES.has(runStatus.status) &&
+        runStatus.status !== "cancelled"
+      ) {
+        liftLocalStop(locallyStoppedRunsRef, setMessages, runStatus.run_id);
+      }
       if (batchRunId === null) {
         batchRunId = runStatus.run_id;
       } else if (batchRunId !== runStatus.run_id) {
@@ -475,6 +577,23 @@ function applyProjectionItems({
   const unambiguousBatchRunId = batchRunIdIsAmbiguous ? null : batchRunId;
   let activeRunId = latestRunIdRef?.current ?? null;
   for (const item of items) {
+    // A locally stopped run is fenced from every projection item except the
+    // terminal run_status that settles it (a non-cancelled terminal status
+    // already lifted the fence in the batch scan above).
+    if (
+      !isTerminalRunStatusItem(item) &&
+      isLocallyStoppedRun(
+        locallyStoppedRunsRef,
+        runIdOfItem(item, {
+          activeRunId,
+          activeRunRef,
+          latestRunIdRef,
+          batchRunId: unambiguousBatchRunId,
+        }),
+      )
+    ) {
+      continue;
+    }
     if (item.run_status) {
       const {
         run_id: runId,
@@ -608,6 +727,8 @@ function applyProjectionItems({
             connectionContextForRunFailure,
             t,
           });
+        } else if (status === "cancelled") {
+          appendRunStoppedMessage(setMessages, { runId, t });
         }
       } else if (!PROMPT_RUN_STATUSES.has(status)) {
         clearPendingGateForRun(setPendingGate, runId, promptRunIdRef);
@@ -664,13 +785,19 @@ function applyProjectionItems({
         let existing = phaseAware.findIndex(
           (m) => m.id === messageId || (timelineMessageId && m.id === timelineMessageId),
         );
-        if (existing < 0 && finalizedText) {
+        if (existing < 0 && finalizedText && textRunId) {
+          // Converge by identity, never by content: the run's live streaming
+          // bubble (a `text-…` projection item) IS the same logical answer
+          // the durable transcript finalizes, even when their strings differ
+          // (the live text concatenates every model call's streamed phases;
+          // the transcript row holds only the final one).
           existing = phaseAware.findLastIndex(
             (message) =>
               message?.role === "assistant" &&
               message.turnRunId === textRunId &&
               message.isFinalReply === false &&
-              message.content === (item.text.body || ""),
+              typeof message.id === "string" &&
+              message.id.startsWith("text-"),
           );
         }
         const next = {
@@ -834,6 +961,8 @@ function settleTerminalRunAfterResolvedPrompt({
       connectionContextForRunFailure,
       t,
     });
+  } else if (status === "cancelled") {
+    appendRunStoppedMessage(setMessages, { runId, t });
   }
 }
 
@@ -943,6 +1072,31 @@ function withoutStreamingAssistantPhaseForRun(messages, runId) {
       ),
   );
   return next.length === messages.length ? messages : next;
+}
+
+function runStoppedMessageId(runId) {
+  return `${RUN_STOPPED_ID_PREFIX}${runId || "unknown"}`;
+}
+
+export function appendRunStoppedMessage(setMessages, { runId, t }) {
+  const messageId = runStoppedMessageId(runId);
+  setMessages((prev) => {
+    const visibleMessages = withoutStreamingAssistantPhaseForRun(prev, runId);
+    if (visibleMessages.some((message) => message.id === messageId)) {
+      return visibleMessages;
+    }
+    return [
+      ...visibleMessages,
+      {
+        id: messageId,
+        role: "system",
+        content: t("chat.runStopped"),
+        timestamp: new Date().toISOString(),
+        turnRunId: runId,
+        runStatus: "cancelled",
+      },
+    ];
+  });
 }
 
 // A projection can report an unknown run failure before the send response maps
