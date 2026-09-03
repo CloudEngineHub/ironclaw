@@ -1,4 +1,3 @@
-// @ts-nocheck
 import { Icon } from "../../../design-system/icons";
 import React from "react";
 import { useT } from "../../../lib/i18n";

@@ -1,4 +1,3 @@
-// @ts-nocheck
 import React from "react";
 import { fetchTimeline } from "../../../lib/api";
 import { authScope } from "../../../lib/auth-scope";
@@ -17,6 +16,22 @@ import {
 } from "../lib/stream-order-memory";
 
 const PAGE_SIZE = 50;
+
+type SequenceWindow = { oldest: number; newest: number };
+type HistoryHookOptions = {
+  getPendingMessages?: () => unknown[];
+  setPendingMessages?: (messages: unknown[]) => void;
+};
+type HistoryLoadOptions = {
+  preserveClientOnly?: boolean;
+  finalReplyTimestampByRun?: Record<string, string> | null;
+};
+type SequenceWindowOptions = {
+  pageSequenceWindow?: SequenceWindow | null;
+  freshSequenceWindow?: SequenceWindow | null;
+  currentSequenceWindow?: SequenceWindow | null;
+};
+type MergeFullRefreshOptions = HistoryLoadOptions & SequenceWindowOptions;
 
 /* Session-lived per-thread message cache (survives component unmount).
  *
@@ -57,7 +72,7 @@ export function clearHistoryCache() {
   historyCache.clear();
 }
 
-export function useHistory(threadId, options = {}) {
+export function useHistory(threadId, options: HistoryHookOptions = {}) {
   const { getPendingMessages, setPendingMessages } = options;
   const cached = threadId ? historyCache.get(cacheKey(threadId)) : null;
   const [state, setState] = React.useState({
@@ -105,7 +120,10 @@ export function useHistory(threadId, options = {}) {
   threadIdRef.current = threadId;
 
   const loadHistory = React.useCallback(
-    async (cursor, loadOptions = {}) => {
+    async (
+      cursor: string | null | undefined = null,
+      loadOptions: HistoryLoadOptions = {},
+    ) => {
       // `preserveClientOnly` keeps client-synthesized messages that never
       // appear in the timeline (run-failure `err-*` bubbles) when a full
       // reload replaces the list. A settle-triggered reload (any terminal
@@ -404,7 +422,7 @@ function cursorPageCanMerge(
   pageMessages,
   currentMessages,
   currentNextCursor,
-  options = {},
+  options: SequenceWindowOptions = {},
 ) {
   return (
     requestedCursor === currentNextCursor ||
@@ -415,7 +433,7 @@ function cursorPageCanMerge(
 function cursorPageConnectsToCurrentOldest(
   pageMessages,
   currentMessages,
-  options = {},
+  options: SequenceWindowOptions = {},
 ) {
   const pageWindow =
     options.pageSequenceWindow || timelineSequenceWindow(pageMessages);
@@ -445,7 +463,7 @@ function nextCursorAfterFullRefresh(
   current,
   freshNextCursor,
   currentNextCursor,
-  options = {},
+  options: SequenceWindowOptions = {},
 ) {
   if (!freshNextCursor) return null;
   const freshSequenceWindow =
@@ -462,7 +480,11 @@ function nextCursorAfterFullRefresh(
     : freshNextCursor;
 }
 
-function mergeFullRefresh(fresh, current, options = {}) {
+function mergeFullRefresh(
+  fresh,
+  current,
+  options: MergeFullRefreshOptions = {},
+) {
   const {
     preserveClientOnly = false,
     finalReplyTimestampByRun = null,
@@ -662,7 +684,11 @@ function timelineSequence(message) {
   return Number.isFinite(sequence) ? sequence : null;
 }
 
-function hydrateFreshMessages(fresh, current, options = {}) {
+function hydrateFreshMessages(
+  fresh,
+  current,
+  options: HistoryLoadOptions = {},
+) {
   const { finalReplyTimestampByRun = null } = options;
   const currentByConfirmedId = new Map();
   const finalAssistantByRun = new Map();
