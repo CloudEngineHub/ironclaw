@@ -45,6 +45,9 @@ pub const REPLY_DISPLAY_TEXT_MAX_BYTES: usize = 2 * 1024;
 pub const REPLY_DISPLAY_PREVIEW_MAX_BYTES: usize = 4 * 1024;
 /// Bound on one product-approved reasoning summary segment.
 pub const REPLY_REASONING_SEGMENT_MAX_BYTES: usize = 8 * 1024;
+/// Bound on one narration entry (the text of a model call the loop went on
+/// past); longer text is kept up to this bound on a character boundary.
+pub const REPLY_NARRATION_ENTRY_MAX_BYTES: usize = 8 * 1024;
 /// Bound on a reply/item identifier.
 pub const REPLY_ITEM_ID_MAX_BYTES: usize = 128;
 /// Bound on activity rows retained per document (older rows stay; later
@@ -52,6 +55,8 @@ pub const REPLY_ITEM_ID_MAX_BYTES: usize = 128;
 pub const REPLY_MAX_ACTIVITIES: usize = 256;
 /// Bound on retained reasoning summary segments.
 pub const REPLY_MAX_REASONING_SEGMENTS: usize = 128;
+/// Bound on retained narration entries (later ones are dropped).
+pub const REPLY_MAX_NARRATION_ENTRIES: usize = 32;
 /// Bound on final attachments.
 pub const REPLY_MAX_ATTACHMENTS: usize = 16;
 /// Bound on the adapter-owned checkpoint the host persists between
@@ -364,12 +369,19 @@ impl ReplyPhase {
     }
 }
 
-/// The answer as it currently stands.
+/// The answer as it currently stands: the text of the current model call.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplyAnswer {
-    /// Cumulative text (progressive appends, then the canonical finalized
-    /// transcript text once the run finalizes it).
+    /// Cumulative text of the current model call (progressive appends, then
+    /// the canonical finalized transcript text once the run finalizes it).
     pub text: ReplyAnswerText,
+    /// Which model call's text this is, counting the calls that produced
+    /// text: a call the loop goes on past ([`ReplyDocument::reset_answer`])
+    /// starts the next one, a call that produced no text does not. A surface
+    /// keys what it shows per call instead of per run. Distinct from the
+    /// document's lifecycle [`ReplyDocument::phase`].
+    #[serde(default = "first_answer_call")]
+    pub call: u64,
     /// True once [`ReplyDocument::finalize_answer`] replaced the progressive
     /// text with the canonical transcript row. Progressive appends after that
     /// are ignored.
@@ -384,10 +396,25 @@ impl Default for ReplyAnswer {
     fn default() -> Self {
         Self {
             text: ReplyAnswerText(String::new()),
+            call: first_answer_call(),
             finalized: false,
             truncated: false,
         }
     }
+}
+
+fn first_answer_call() -> u64 {
+    1
+}
+
+/// The text of one model call the loop went on past — narration such as
+/// "Let me check the workspace.", never the answer — kept under the call it
+/// streamed as, so a surface that showed it as the provisional answer can
+/// re-home it, and a surface that never shows narration can ignore it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplyNarration {
+    pub call: u64,
+    pub text: ReplyAnswerText,
 }
 
 /// Lifecycle state of one capability/tool activity row. The projection folds
@@ -512,6 +539,15 @@ pub struct ReplyDocument {
     pub status_kind: Option<ReplyStatusKind>,
     #[serde(default)]
     pub answer: ReplyAnswer,
+    /// Text of the model calls the loop went on past, in call order
+    /// ([`ReplyDocument::reset_answer`]). Progress, not the answer: a
+    /// surface with an activity panel shows it there; a stream surface
+    /// never shows it. Bounded like every facet of this display document
+    /// ([`REPLY_MAX_NARRATION_ENTRIES`] entries of
+    /// [`REPLY_NARRATION_ENTRY_MAX_BYTES`]); the durable transcript keeps
+    /// every model call in full.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub narration: Vec<ReplyNarration>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reasoning: Vec<ReplyReasoningText>,
     /// True while the last reasoning segment is still being produced
@@ -542,6 +578,7 @@ impl Default for ReplyDocument {
             status: None,
             status_kind: None,
             answer: ReplyAnswer::default(),
+            narration: Vec::new(),
             reasoning: Vec::new(),
             reasoning_open: false,
             activities: Vec::new(),
@@ -616,6 +653,31 @@ impl ReplyDocument {
         self.answer.text = ReplyAnswerText(String::new());
         self.answer.truncated = false;
         self.push_answer_bounded(text);
+        true
+    }
+
+    /// The loop went on past the model call that produced the answer — a
+    /// capability ran, a gate blocked, another call started — so that text
+    /// was narration, not the answer: it moves to [`Self::narration`] under
+    /// its call and the next call's answer starts empty. This is the transcript's
+    /// own rule (only the run's final assistant message is the answer)
+    /// applied progressively. Ignored once finalized or terminal; a no-op
+    /// while the answer is empty.
+    pub fn reset_answer(&mut self) -> bool {
+        if self.is_terminal() || self.answer.finalized || self.answer.text.0.is_empty() {
+            return false;
+        }
+        self.next_ordinal();
+        if self.narration.len() < REPLY_MAX_NARRATION_ENTRIES {
+            let text = char_boundary_prefix(&self.answer.text.0, REPLY_NARRATION_ENTRY_MAX_BYTES);
+            self.narration.push(ReplyNarration {
+                call: self.answer.call,
+                text: ReplyAnswerText(text.to_string()),
+            });
+        }
+        self.answer.text = ReplyAnswerText(String::new());
+        self.answer.truncated = false;
+        self.answer.call = self.answer.call.saturating_add(1);
         true
     }
 

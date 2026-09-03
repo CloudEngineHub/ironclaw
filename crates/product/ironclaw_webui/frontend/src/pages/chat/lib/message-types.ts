@@ -5,6 +5,10 @@ export const CHAT_MESSAGE_ROLES = Object.freeze({
   ERROR: "error",
   TOOL_ACTIVITY: "tool_activity",
   THINKING: "thinking",
+  /** Live assistant text the loop went on past (a tool call followed it):
+   *  progress narration that belongs with the run's activity, never the
+   *  answer. Set from the projection's `narration` flag. */
+  NARRATION: "narration",
   IMAGE: "image",
 } as const);
 

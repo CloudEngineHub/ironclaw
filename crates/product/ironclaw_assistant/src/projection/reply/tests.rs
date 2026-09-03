@@ -84,6 +84,15 @@ fn fixture(label: &str) -> Fixture {
     }
 }
 
+/// The document's narration as `(call, text)` pairs.
+fn narration(document: &ironclaw_extension_contracts::reply::ReplyDocument) -> Vec<(u64, String)> {
+    document
+        .narration
+        .iter()
+        .map(|entry| (entry.call, entry.text.as_str().to_string()))
+        .collect()
+}
+
 impl Fixture {
     fn milestone(&self, kind: LoopHostMilestoneKind) -> LoopHostMilestone {
         LoopHostMilestone {
@@ -158,7 +167,13 @@ fn a_failed_model_calls_partial_text_is_discarded_when_the_call_is_retried() {
     fixture.observe(LoopHostMilestoneKind::ModelTextDelta {
         safe_text: "World".to_string(),
     });
-    assert_eq!(fixture.document().answer.text.as_str(), "World");
+    let document = fixture.document();
+    assert_eq!(document.answer.text.as_str(), "World");
+    assert!(
+        document.narration.is_empty(),
+        "a failed call's fragment is dropped, not kept as narration"
+    );
+    assert_eq!(document.answer.call, 1, "a retry is not a new call");
 }
 
 #[test]
@@ -782,9 +797,17 @@ fn a_revision_floor_seeds_numbering_for_a_run_rebuilt_on_another_process() {
     );
 }
 
+/// The answer is the text of the current model call, nothing else. The
+/// moment the loop does anything after a call other than end the run — here
+/// a capability invocation — that call's text was narration ("I’ll research
+/// this first."): it moves to the document's narration under its phase and
+/// the answer starts empty for the next call. This is the transcript's own
+/// rule (only the final assistant message is the answer), applied
+/// progressively.
 #[test]
-fn model_text_is_cumulative_per_call_and_calls_concatenate_as_phases() {
-    let fixture = fixture("phases");
+fn a_finished_calls_text_becomes_narration_once_a_capability_follows_it() {
+    let fixture = fixture("narration-capability");
+    let activity_id = CapabilityActivityId::new();
     fixture.observe(LoopHostMilestoneKind::ModelStarted {
         requested_model_profile_id: None,
     });
@@ -796,13 +819,44 @@ fn model_text_is_cumulative_per_call_and_calls_concatenate_as_phases() {
     });
     assert_eq!(
         fixture.document().answer.text.as_str(),
-        "I’ll research this first."
+        "I’ll research this first.",
+        "the current call's cumulative text is the provisional answer"
     );
     fixture.observe(LoopHostMilestoneKind::ModelCompleted {
         effective_model_profile_id: ironclaw_loop_contracts::ModelProfileId::new("test-model")
             .unwrap(),
     });
-    // A tool runs, then a second model call streams its own cumulative text.
+    assert_eq!(
+        fixture.document().answer.text.as_str(),
+        "I’ll research this first.",
+        "a completed call stays the answer until the loop continues"
+    );
+
+    fixture.observe(LoopHostMilestoneKind::CapabilityInvoked {
+        activity_id,
+        capability_id: CapabilityId::new("acme.search").unwrap(),
+    });
+    let document = fixture.document();
+    assert_eq!(
+        document.answer.text.as_str(),
+        "",
+        "the tool call proves the text was narration"
+    );
+    assert_eq!(
+        document.answer.call, 2,
+        "the answer moved on to the next call"
+    );
+    assert_eq!(
+        narration(&document),
+        vec![(1, "I’ll research this first.".to_string())],
+        "the narration is kept under the phase it streamed as"
+    );
+    assert!(document.reasoning.is_empty(), "narration is not reasoning");
+    assert_eq!(document.activities.len(), 1);
+
+    // The next call's cumulative text is the answer again; a call that
+    // restarts its text (shorter cumulative text) is a rewrite, not an
+    // append, and not a new call.
     fixture.observe(LoopHostMilestoneKind::ModelStarted {
         requested_model_profile_id: None,
     });
@@ -812,32 +866,185 @@ fn model_text_is_cumulative_per_call_and_calls_concatenate_as_phases() {
     fixture.observe(LoopHostMilestoneKind::ModelTextDelta {
         safe_text: "Here is the final answer.".to_string(),
     });
-    let document = fixture.document();
     assert_eq!(
-        document.answer.text.as_str(),
-        "I’ll research this first.\n\nHere is the final answer.",
-        "each model call's text lands after the previous call's, never duplicated"
+        fixture.document().answer.text.as_str(),
+        "Here is the final answer."
     );
-    // A call that restarts its text (shorter cumulative text) is a rewrite,
-    // not an append.
     fixture.observe(LoopHostMilestoneKind::ModelTextDelta {
         safe_text: "Actually, here it is.".to_string(),
     });
+    let document = fixture.document();
+    assert_eq!(document.answer.text.as_str(), "Actually, here it is.");
+    assert_eq!(document.answer.call, 2);
+    assert_eq!(document.narration.len(), 1);
+}
+
+/// A call that ended without a tool call but did not end the run (the loop
+/// nudged the model on, or drained queued follow-up input) is narration too:
+/// the next call starting demotes it.
+#[test]
+fn a_finished_calls_text_becomes_narration_once_another_call_follows_it() {
+    let fixture = fixture("narration-next-call");
+    fixture.observe(LoopHostMilestoneKind::ModelStarted {
+        requested_model_profile_id: None,
+    });
+    fixture.observe(LoopHostMilestoneKind::ModelTextDelta {
+        safe_text: "Let me write the file:".to_string(),
+    });
+    fixture.observe(LoopHostMilestoneKind::ModelCompleted {
+        effective_model_profile_id: ironclaw_loop_contracts::ModelProfileId::new("test-model")
+            .unwrap(),
+    });
+    fixture.observe(LoopHostMilestoneKind::ModelStarted {
+        requested_model_profile_id: None,
+    });
+    let document = fixture.document();
+    assert_eq!(document.answer.text.as_str(), "");
     assert_eq!(
-        fixture.document().answer.text.as_str(),
-        "I’ll research this first.\n\nActually, here it is."
+        narration(&document),
+        vec![(1, "Let me write the file:".to_string())]
+    );
+    fixture.observe(LoopHostMilestoneKind::ModelTextDelta {
+        safe_text: "Done.".to_string(),
+    });
+    let document = fixture.document();
+    assert_eq!(document.answer.text.as_str(), "Done.");
+    assert_eq!(document.answer.call, 2);
+}
+
+/// Text ahead of a gate is narration by construction: the gate comes from a
+/// tool call the same model call produced. It is demoted when the gate
+/// blocks, so no surface shows it beside the attention block.
+#[test]
+fn text_ahead_of_a_gate_is_narration_not_answer() {
+    let fixture = fixture("narration-gate");
+    fixture.observe(LoopHostMilestoneKind::ModelStarted {
+        requested_model_profile_id: None,
+    });
+    fixture.observe(LoopHostMilestoneKind::ModelTextDelta {
+        safe_text: "Let me send the summary.".to_string(),
+    });
+    fixture.observe(LoopHostMilestoneKind::ModelCompleted {
+        effective_model_profile_id: ironclaw_loop_contracts::ModelProfileId::new("test-model")
+            .unwrap(),
+    });
+    fixture.observe(LoopHostMilestoneKind::GateBlocked {
+        iteration: 1,
+        gate_kind: LoopGateKind::Approval,
+    });
+    let document = fixture.document();
+    assert_eq!(document.answer.text.as_str(), "");
+    assert_eq!(
+        narration(&document),
+        vec![(1, "Let me send the summary.".to_string())]
+    );
+    assert_eq!(
+        document.attention.as_ref().map(|attention| attention.kind),
+        Some(ReplyAttentionKind::Approval)
+    );
+    fixture.observe(LoopHostMilestoneKind::Blocked {
+        gate_ref: LoopGateRef::new("gate:approval-1").unwrap(),
+        checkpoint_id: TurnCheckpointId::new(),
+    });
+    let document = fixture.document();
+    assert_eq!(document.answer.text.as_str(), "");
+    assert_eq!(document.narration.len(), 1, "the reset is idempotent");
+    assert_eq!(document.answer.call, 2);
+}
+
+/// Narration is bounded like every facet of this display document (the
+/// durable transcript keeps every model call in full): at most
+/// `REPLY_MAX_NARRATION_ENTRIES` entries, each cut to
+/// `REPLY_NARRATION_ENTRY_MAX_BYTES` on a character boundary. The answer
+/// still resets and moves to the next phase past the bound.
+#[test]
+fn narration_is_bounded_like_reasoning() {
+    use ironclaw_extension_contracts::reply::{
+        REPLY_MAX_NARRATION_ENTRIES, REPLY_NARRATION_ENTRY_MAX_BYTES,
+    };
+    let fixture = fixture("narration-bounds");
+    let long = "é".repeat(REPLY_NARRATION_ENTRY_MAX_BYTES);
+    for call in 1..=(REPLY_MAX_NARRATION_ENTRIES as u64 + 1) {
+        fixture.observe(LoopHostMilestoneKind::ModelStarted {
+            requested_model_profile_id: None,
+        });
+        fixture.observe(LoopHostMilestoneKind::ModelTextDelta {
+            safe_text: if call == 1 {
+                long.clone()
+            } else {
+                format!("call {call}")
+            },
+        });
+        fixture.observe(LoopHostMilestoneKind::CapabilityInvoked {
+            activity_id: CapabilityActivityId::new(),
+            capability_id: CapabilityId::new("acme.search").unwrap(),
+        });
+    }
+    let document = fixture.document();
+    assert_eq!(document.narration.len(), REPLY_MAX_NARRATION_ENTRIES);
+    assert_eq!(
+        document.narration[0].text.as_str().len(),
+        REPLY_NARRATION_ENTRY_MAX_BYTES,
+        "cut to the byte bound on a character boundary"
+    );
+    assert!(
+        document.narration[0]
+            .text
+            .as_str()
+            .chars()
+            .all(|c| c == 'é')
+    );
+    assert_eq!(
+        document.narration.last().map(|entry| entry.text.as_str()),
+        Some("call 32"),
+        "the entry past the bound is dropped"
+    );
+    assert_eq!(document.answer.text.as_str(), "");
+    assert_eq!(
+        document.answer.call,
+        REPLY_MAX_NARRATION_ENTRIES as u64 + 2,
+        "the answer still moves on past the bound"
     );
 }
 
-/// A tool run streams text in more than one model call (pre-tool commentary,
-/// then the answer), but the durable transcript finalizes only the run's
-/// final assistant message. The canonical text is the final phase of what
-/// was already streamed, so finalization must converge IN PLACE — replacing
-/// the shown text with its own tail would break every stream presentation's
-/// prefix-extension invariant (the Slack terminal reconcile would see a
-/// rewrite and duplicate the answer beside the stream).
+/// A call's provider reasoning stays reasoning and its narration stays
+/// narration: two facets, never merged.
 #[test]
-fn terminal_facts_matching_the_final_phase_finalize_in_place() {
+fn narration_is_kept_apart_from_the_calls_reasoning() {
+    let fixture = fixture("narration-order");
+    fixture.observe(LoopHostMilestoneKind::ModelStarted {
+        requested_model_profile_id: None,
+    });
+    fixture.observe(LoopHostMilestoneKind::ModelReasoningDelta {
+        safe_delta: "Looking at the repo".to_string(),
+    });
+    fixture.observe(LoopHostMilestoneKind::ModelTextDelta {
+        safe_text: "Let me check.".to_string(),
+    });
+    fixture.observe(LoopHostMilestoneKind::CapabilityInvoked {
+        activity_id: CapabilityActivityId::new(),
+        capability_id: CapabilityId::new("acme.search").unwrap(),
+    });
+    let document = fixture.document();
+    assert_eq!(
+        document
+            .reasoning
+            .iter()
+            .map(|segment| segment.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Looking at the repo"]
+    );
+    assert!(!document.reasoning_open);
+    assert_eq!(narration(&document), vec![(1, "Let me check.".to_string())]);
+    assert_eq!(document.answer.text.as_str(), "");
+}
+
+/// The durable transcript finalizes only the run's final assistant message,
+/// which is exactly the final call's streamed text: finalization converges
+/// IN PLACE (no rewrite), so no stream presentation sees a prefix break at
+/// the terminal. The earlier call's text is already narration.
+#[test]
+fn terminal_facts_matching_the_final_calls_text_finalize_in_place() {
     let live = fixture("terminal-in-place");
     live.observe(LoopHostMilestoneKind::ModelStarted {
         requested_model_profile_id: None,
@@ -859,12 +1066,23 @@ fn terminal_facts_matching_the_final_phase_finalize_in_place() {
         effective_model_profile_id: ironclaw_loop_contracts::ModelProfileId::new("scripted")
             .unwrap(),
     });
+    let document = live.document();
     assert_eq!(
-        live.document().answer.text.as_str(),
-        "Let me check the workspace.\n\nThe answer is 42.",
-        "the progressive answer joins the finished phases"
+        document.answer.text.as_str(),
+        "The answer is 42.",
+        "the progressive answer is the final call's text alone"
+    );
+    assert_eq!(document.answer.call, 2);
+    assert_eq!(
+        narration(&document),
+        vec![(1, "Let me check the workspace.".to_string())]
     );
 
+    let revision_before = live
+        .projection
+        .snapshot(&live.scope, live.run_id)
+        .expect("tracked")
+        .revision;
     let snapshot = live.projection.apply_terminal_facts(
         &live.scope,
         live.run_id,
@@ -880,11 +1098,14 @@ fn terminal_facts_matching_the_final_phase_finalize_in_place() {
     let document = &snapshot.document;
     assert!(document.answer.finalized);
     assert_eq!(document.outcome, Some(ReplyOutcome::Completed));
+    assert_eq!(document.answer.text.as_str(), "The answer is 42.");
+    assert_eq!(document.answer.call, 2, "finalization keeps the final call");
     assert_eq!(
-        document.answer.text.as_str(),
-        "Let me check the workspace.\n\nThe answer is 42.",
-        "a canonical text that is the shown text's final phase finalizes in place"
+        document.narration.len(),
+        1,
+        "finalization leaves the narration alone"
     );
+    assert_eq!(snapshot.revision, revision_before + 1);
 }
 
 /// The empty-transcript completion (`answer: None` — nothing to report, or a

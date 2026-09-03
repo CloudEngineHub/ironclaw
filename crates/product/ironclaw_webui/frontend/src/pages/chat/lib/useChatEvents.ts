@@ -747,6 +747,11 @@ function applyProjectionItems({
       // truth for clearing pendingGate/processing.
       const textRunId = item.text.run_id || null;
       const finalizedText = item.text.finalized === true;
+      // The loop went on past the model call that produced this text (a
+      // tool call followed it): the item is republished, flagged, under the
+      // id it streamed as. It is progress narration for the activity run,
+      // never a new streaming phase.
+      const narration = item.text.narration === true;
       const messageId = `${finalizedText ? "msg" : "text"}-${item.text.id}`;
       if (
         textRunId &&
@@ -765,18 +770,27 @@ function applyProjectionItems({
         ) {
           return prev;
         }
-        const phaseAware = textRunId
-          ? prev.map((message) =>
-              message?.role === "assistant" &&
-              message.turnRunId === textRunId &&
-              message.isFinalReply === false &&
-              message.id !== messageId
-                ? { ...message, isStreaming: false }
-                : message,
-            )
-          : prev;
+        // A new phase's text (one live item per model call) settles the
+        // earlier phases of the run; a narration republish is not a new
+        // phase and leaves the streaming answer alone.
+        const phaseAware =
+          textRunId && !narration
+            ? prev.map((message) =>
+                message?.role === "assistant" &&
+                message.turnRunId === textRunId &&
+                message.isFinalReply === false &&
+                message.id !== messageId
+                  ? { ...message, isStreaming: false }
+                  : message,
+              )
+            : prev;
+        // Once the run's final reply is rendered, late answer phases are
+        // stale and ignored — but a narration republish is activity for the
+        // run's collapsible section, and the live and durable rails are
+        // independent, so it may legitimately arrive after the final reply.
         if (
           textRunId &&
+          !narration &&
           phaseAware.some((m) => isFinalAssistantForRun(m, textRunId))
         ) {
           return phaseAware;
@@ -786,11 +800,11 @@ function applyProjectionItems({
           (m) => m.id === messageId || (timelineMessageId && m.id === timelineMessageId),
         );
         if (existing < 0 && finalizedText && textRunId) {
-          // Converge by identity, never by content: the run's live streaming
-          // bubble (a `text-…` projection item) IS the same logical answer
-          // the durable transcript finalizes, even when their strings differ
-          // (the live text concatenates every model call's streamed phases;
-          // the transcript row holds only the final one).
+          // Converge by identity, never by content: the run's last live
+          // streaming bubble (the final phase's `text-…` projection item)
+          // IS the same logical answer the durable transcript finalizes,
+          // even when their strings differ. Earlier phases are narration
+          // and stay in the activity run.
           existing = phaseAware.findLastIndex(
             (message) =>
               message?.role === "assistant" &&
@@ -800,15 +814,17 @@ function applyProjectionItems({
               message.id.startsWith("text-"),
           );
         }
+        // Narration is its own role, like reasoning: every `assistant`
+        // predicate excludes it by construction.
         const next = {
           ...(existing >= 0 ? phaseAware[existing] : {}),
           id: messageId,
-          role: "assistant",
+          role: narration ? "narration" : "assistant",
           content: item.text.body || "",
           timestamp: phaseAware[existing]?.timestamp || new Date().toISOString(),
           turnRunId: phaseAware[existing]?.turnRunId || textRunId,
           isFinalReply: finalizedText,
-          isStreaming: !finalizedText,
+          isStreaming: !finalizedText && !narration,
         };
         if (existing >= 0) {
           const copy = [...phaseAware];
